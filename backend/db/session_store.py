@@ -1,14 +1,17 @@
 """
-Session Store — SQLite-backed conversation history
+Session Store — SQLite-backed conversation history  v1.5
 
-Stores every query, answer, confidence score, references, agent trace and SHAP data.
-Uses Python's built-in sqlite3 — no extra packages needed.
+Changes from v1.3:
+  - Added faithfulness_json, lime_json, trust_json columns to messages table
+  - _migrate_db() adds missing columns to existing databases without data loss
+    (safe to run on an existing sessions.db — ALTER TABLE IF NOT EXISTS equivalent)
+  - save_message() accepts faithfulness_data, lime_data, trust_data
+  - _row_to_dict() deserialises all 6 JSON blob fields
+  - get_recent_turns_for_prompt() unchanged — chat memory unaffected
 
-Database file: backend/sessions.db (auto-created on first run)
-
-New in v1.3 (chat mode):
-  get_recent_turns_for_prompt() — returns last N turns formatted as a
-  conversation string ready to inject into the Synthesiser prompt.
+Tables:
+  sessions  — one row per unique session_id
+  messages  — one row per query/response pair, linked to sessions
 """
 import sqlite3
 import json
@@ -29,7 +32,10 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def init_db():
-    """Create tables and indexes if they don't exist. Safe to call on every startup."""
+    """
+    Create tables and indexes if they don't exist, then migrate any
+    existing database to add new columns. Safe to call multiple times.
+    """
     conn = _get_conn()
     try:
         conn.executescript("""
@@ -40,16 +46,19 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS messages (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id       TEXT NOT NULL,
-                timestamp        TEXT NOT NULL,
-                query            TEXT NOT NULL,
-                answer           TEXT NOT NULL,
-                confidence       REAL NOT NULL,
-                mode             TEXT NOT NULL,
-                references_json  TEXT NOT NULL DEFAULT '[]',
-                agent_trace_json TEXT NOT NULL DEFAULT '[]',
-                shap_json        TEXT NOT NULL DEFAULT '{}'
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id          TEXT NOT NULL,
+                timestamp           TEXT NOT NULL,
+                query               TEXT NOT NULL,
+                answer              TEXT NOT NULL,
+                confidence          REAL NOT NULL,
+                mode                TEXT NOT NULL,
+                references_json     TEXT NOT NULL DEFAULT '[]',
+                agent_trace_json    TEXT NOT NULL DEFAULT '[]',
+                shap_json           TEXT NOT NULL DEFAULT '{}',
+                faithfulness_json   TEXT NOT NULL DEFAULT '{}',
+                lime_json           TEXT NOT NULL DEFAULT '{}',
+                trust_json          TEXT NOT NULL DEFAULT '{}'
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_session
@@ -63,18 +72,55 @@ def init_db():
     finally:
         conn.close()
 
+    # Migrate existing DB — adds new columns if they don't exist yet
+    _migrate_db()
+
+
+def _migrate_db():
+    """
+    Add v1.5 columns to an existing database that was created before they existed.
+    SQLite doesn't support IF NOT EXISTS on ALTER TABLE, so we check the
+    existing column list first.
+    """
+    conn = _get_conn()
+    try:
+        # Get current columns
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        new_cols = {
+            "faithfulness_json": "TEXT NOT NULL DEFAULT '{}'",
+            "lime_json":         "TEXT NOT NULL DEFAULT '{}'",
+            "trust_json":        "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for col, definition in new_cols.items():
+            if col not in cols:
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {definition}")
+                logger.info(f"Migrated DB: added column '{col}'")
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"DB migration warning: {e}")
+    finally:
+        conn.close()
+
 
 def save_message(
-    session_id: str,
-    query: str,
-    answer: str,
-    confidence: float,
-    mode: str,
-    references: list,
-    agent_trace: list,
-    shap_analysis: dict,
+    session_id:        str,
+    query:             str,
+    answer:            str,
+    confidence:        float,
+    mode:              str,
+    references:        list,
+    agent_trace:       list,
+    shap_analysis:     dict,
+    faithfulness_data: dict = None,
+    lime_data:         dict = None,
+    trust_data:        dict = None,
 ) -> int:
-    """Persist a query + response. Returns the new message id."""
+    """
+    Persist a query + response to the messages table.
+    New fields faithfulness_data, lime_data, trust_data default to {} if not supplied
+    (backwards compatible with callers that don't yet pass them).
+    Returns the new message id.
+    """
     conn = _get_conn()
     try:
         now = datetime.utcnow().isoformat()
@@ -85,8 +131,9 @@ def save_message(
         cur = conn.execute(
             """INSERT INTO messages
                (session_id, timestamp, query, answer, confidence, mode,
-                references_json, agent_trace_json, shap_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                references_json, agent_trace_json, shap_json,
+                faithfulness_json, lime_json, trust_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
                 now,
@@ -94,14 +141,17 @@ def save_message(
                 answer,
                 float(confidence),
                 mode,
-                json.dumps(references,    default=str),
-                json.dumps(agent_trace,   default=str),
-                json.dumps(shap_analysis, default=str),
+                json.dumps(references,            default=str),
+                json.dumps(agent_trace,           default=str),
+                json.dumps(shap_analysis or {},   default=str),
+                json.dumps(faithfulness_data or {}, default=str),
+                json.dumps(lime_data or {},        default=str),
+                json.dumps(trust_data or {},       default=str),
             ),
         )
         conn.commit()
         msg_id = cur.lastrowid
-        logger.info(f"Saved message id={msg_id} session={session_id[:8]}")
+        logger.info(f"Saved message id={msg_id} for session {session_id[:8]}")
         return msg_id
     except Exception as e:
         logger.error(f"Failed to save message: {e}", exc_info=True)
@@ -110,65 +160,16 @@ def save_message(
         conn.close()
 
 
-def get_recent_turns_for_prompt(session_id: str, n: int = 10) -> str:
-    """
-    Return the last N turns for a session as a formatted conversation string
-    ready to inject into the Synthesiser LLM prompt.
-
-    Format:
-      User: <query>
-      Assistant: <answer — stripped of the References Used section>
-
-      User: <query>
-      Assistant: <answer>
-      ...
-
-    The References Used section is stripped from answers because it is
-    reconstructed fresh each turn — including it would bloat the prompt
-    with redundant file/chunk metadata the LLM doesn't need for context.
-
-    Returns empty string "" if no prior turns exist (first message in session).
-    """
-    conn = _get_conn()
-    try:
-        rows = conn.execute(
-            """SELECT query, answer
-               FROM messages
-               WHERE session_id = ?
-               ORDER BY timestamp DESC
-               LIMIT ?""",
-            (session_id, n),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    if not rows:
-        return ""
-
-    # Reverse so oldest turn is first (chronological order for LLM)
-    turns = list(reversed(rows))
-    lines = []
-    for row in turns:
-        q = row["query"].strip()
-        # Strip the "--- References Used:" footer from the answer
-        raw_answer = row["answer"] or ""
-        answer_clean = raw_answer.split("\n\n---\n")[0].strip()
-        # Truncate very long answers to keep prompt manageable (~400 chars each)
-        if len(answer_clean) > 400:
-            answer_clean = answer_clean[:400] + "…"
-        lines.append(f"User: {q}\nAssistant: {answer_clean}")
-
-    return "\n\n".join(lines)
-
-
 def get_session_history(session_id: str) -> List[Dict]:
-    """All messages for a session, oldest first."""
+    """Return all messages for a session, oldest first."""
     conn = _get_conn()
     try:
         rows = conn.execute(
             """SELECT id, session_id, timestamp, query, answer, confidence, mode,
-                      references_json, agent_trace_json, shap_json
-               FROM messages WHERE session_id = ?
+                      references_json, agent_trace_json, shap_json,
+                      faithfulness_json, lime_json, trust_json
+               FROM messages
+               WHERE session_id = ?
                ORDER BY timestamp ASC""",
             (session_id,),
         ).fetchall()
@@ -178,7 +179,7 @@ def get_session_history(session_id: str) -> List[Dict]:
 
 
 def get_all_sessions() -> List[Dict]:
-    """All sessions with message count, avg confidence, last activity."""
+    """List all sessions with message count, first query, and last activity."""
     conn = _get_conn()
     try:
         rows = conn.execute(
@@ -200,15 +201,17 @@ def get_all_sessions() -> List[Dict]:
 
 
 def search_history(keyword: str, limit: int = 20) -> List[Dict]:
-    """Full-text search across all stored queries and answers."""
+    """Full-text search across stored queries and answers."""
     conn = _get_conn()
     try:
         rows = conn.execute(
             """SELECT id, session_id, timestamp, query, answer, confidence, mode,
-                      references_json, agent_trace_json, shap_json
+                      references_json, agent_trace_json, shap_json,
+                      faithfulness_json, lime_json, trust_json
                FROM messages
                WHERE query LIKE ? OR answer LIKE ?
-               ORDER BY timestamp DESC LIMIT ?""",
+               ORDER BY timestamp DESC
+               LIMIT ?""",
             (f"%{keyword}%", f"%{keyword}%", limit),
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
@@ -217,13 +220,16 @@ def search_history(keyword: str, limit: int = 20) -> List[Dict]:
 
 
 def get_recent_messages(limit: int = 20) -> List[Dict]:
-    """Most recent messages across all sessions."""
+    """Get most recent messages across all sessions."""
     conn = _get_conn()
     try:
         rows = conn.execute(
             """SELECT id, session_id, timestamp, query, answer, confidence, mode,
-                      references_json, agent_trace_json, shap_json
-               FROM messages ORDER BY timestamp DESC LIMIT ?""",
+                      references_json, agent_trace_json, shap_json,
+                      faithfulness_json, lime_json, trust_json
+               FROM messages
+               ORDER BY timestamp DESC
+               LIMIT ?""",
             (limit,),
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
@@ -232,12 +238,13 @@ def get_recent_messages(limit: int = 20) -> List[Dict]:
 
 
 def get_message_by_id(message_id: int) -> Optional[Dict]:
-    """Single message by integer id."""
+    """Get a single saved message by its integer id."""
     conn = _get_conn()
     try:
         row = conn.execute(
             """SELECT id, session_id, timestamp, query, answer, confidence, mode,
-                      references_json, agent_trace_json, shap_json
+                      references_json, agent_trace_json, shap_json,
+                      faithfulness_json, lime_json, trust_json
                FROM messages WHERE id = ?""",
             (message_id,),
         ).fetchone()
@@ -247,10 +254,12 @@ def get_message_by_id(message_id: int) -> Optional[Dict]:
 
 
 def delete_session(session_id: str) -> int:
-    """Delete all messages and session row. Returns messages deleted."""
+    """Delete all messages and the session row. Returns number of messages deleted."""
     conn = _get_conn()
     try:
-        cur = conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        cur = conn.execute(
+            "DELETE FROM messages WHERE session_id = ?", (session_id,)
+        )
         deleted = cur.rowcount
         conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         conn.commit()
@@ -266,11 +275,11 @@ def get_stats() -> Dict:
     try:
         row = conn.execute(
             """SELECT
-                 COUNT(*)                    AS total_messages,
-                 COUNT(DISTINCT session_id)  AS total_sessions,
-                 AVG(confidence)             AS avg_confidence,
-                 MIN(timestamp)              AS earliest,
-                 MAX(timestamp)              AS latest
+                 COUNT(*)                   AS total_messages,
+                 COUNT(DISTINCT session_id) AS total_sessions,
+                 AVG(confidence)            AS avg_confidence,
+                 MIN(timestamp)             AS earliest,
+                 MAX(timestamp)             AS latest
                FROM messages"""
         ).fetchone()
         return dict(row) if row else {}
@@ -278,18 +287,54 @@ def get_stats() -> Dict:
         conn.close()
 
 
+def get_recent_turns_for_prompt(session_id: str, n: int = 10) -> str:
+    """
+    Fetch last N turns for a session and format as a conversation string
+    for injection into the LLM prompt.
+    Strips the References Used footer from answers to keep prompts lean.
+    """
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT query, answer FROM messages
+               WHERE session_id = ?
+               ORDER BY timestamp DESC
+               LIMIT ?""",
+            (session_id, n),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return ""
+
+    turns = []
+    for row in reversed(rows):
+        q = row["query"]
+        a = row["answer"].split("\n\n---\n")[0].strip()   # strip References footer
+        turns.append(f"User: {q}\nAssistant: {a}")
+
+    return "\n\n".join(turns)
+
+
+# ── Internal helper ───────────────────────────────────────────────────────────
+
 def _row_to_dict(row: sqlite3.Row) -> Dict:
-    """Convert sqlite3.Row to plain dict, deserialising JSON blob fields."""
+    """Convert sqlite3.Row to plain dict, deserialising all JSON blob fields."""
     d = dict(row)
-    for json_field, clean_key in [
-        ("references_json",  "references"),
-        ("agent_trace_json", "agent_trace"),
-        ("shap_json",        "shap_analysis"),
-    ]:
+    json_fields = [
+        ("references_json",   "references"),
+        ("agent_trace_json",  "agent_trace"),
+        ("shap_json",         "shap_analysis"),
+        ("faithfulness_json", "faithfulness_data"),
+        ("lime_json",         "lime_data"),
+        ("trust_json",        "trust_data"),
+    ]
+    for json_field, clean_key in json_fields:
         if json_field in d:
             try:
                 d[clean_key] = json.loads(d.pop(json_field))
             except (json.JSONDecodeError, TypeError):
-                d[clean_key] = []
+                d[clean_key] = {}
                 d.pop(json_field, None)
     return d

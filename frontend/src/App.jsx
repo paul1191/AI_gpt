@@ -1212,16 +1212,32 @@ function ChatMessageBubble({ msg }) {
 
   return (
     <div style={{ marginBottom: 24 }}>
+      {/* Restored-from-history banner */}
+      {msg.isRestored && (
+        <div style={{
+          display: "flex", alignItems: "center", gap: 6,
+          padding: "4px 12px", marginBottom: 6,
+          background: `${c.accent2}18`, border: `1px solid ${c.accent2}33`,
+          borderRadius: 6, fontSize: 10, color: c.accent2,
+        }}>
+          🗂️ Restored from history · Message ID: {msg.message_id}
+          <span style={{ color: c.muted, marginLeft: 4 }}>
+            {msg.timestamp ? new Date(msg.timestamp).toLocaleString() : ""}
+          </span>
+        </div>
+      )}
+
       {/* User */}
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
         <div style={{
           maxWidth: "78%", padding: "10px 14px",
-          background: `${c.accent2}22`, border: `1px solid ${c.accent2}44`,
+          background: msg.isRestored ? `${c.purple}22` : `${c.accent2}22`,
+          border: `1px solid ${msg.isRestored ? c.purple : c.accent2}44`,
           borderRadius: "12px 12px 3px 12px", fontSize: 13, color: c.text, lineHeight: 1.5,
         }}>
           {msg.query}
           <div style={{ fontSize: 9, color: c.muted, marginTop: 4, textAlign: "right" }}>
-            Turn {msg.turn_number} · {msg.mode}
+            {msg.isRestored ? "📂 history" : `Turn ${msg.turn_number}`} · {msg.mode}
           </div>
         </div>
       </div>
@@ -1229,7 +1245,8 @@ function ChatMessageBubble({ msg }) {
       {/* Assistant */}
       <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
         <div style={{
-          width: 28, height: 28, borderRadius: "50%", background: c.accent,
+          width: 28, height: 28, borderRadius: "50%",
+          background: msg.isRestored ? c.purple : c.accent,
           display: "flex", alignItems: "center", justifyContent: "center",
           fontSize: 14, flexShrink: 0, marginTop: 2,
         }}>⚖️</div>
@@ -1316,7 +1333,7 @@ function ChatMessageBubble({ msg }) {
   );
 }
 
-function ChatMode() {
+function ChatMode({ restoreMsg = null, onRestoreConsumed = null }) {
   const [messages, setMessages]   = useState([]);
   const [query, setQuery]         = useState("");
   const [loading, setLoading]     = useState(false);
@@ -1325,10 +1342,30 @@ function ChatMode() {
   const [sessionId, setSessionId] = useState(() => crypto.randomUUID());
   const threadRef = useRef();
 
+  // Auto-scroll on new messages
   useEffect(() => {
     if (threadRef.current)
       threadRef.current.scrollTop = threadRef.current.scrollHeight;
   }, [messages]);
+
+  // Inject a restored history message into the thread
+  useEffect(() => {
+    if (!restoreMsg) return;
+    const historyBubble = {
+      ...restoreMsg,
+      id:            "restored-" + (restoreMsg.message_id ?? Date.now()),
+      loading:       false,
+      error:         null,
+      turn_number:   restoreMsg.turn_number ?? "?",
+      isRestored:    true,   // flag so UI can show a badge
+    };
+    setMessages(prev => {
+      // Don't add if already present
+      if (prev.some(m => m.id === historyBubble.id)) return prev;
+      return [...prev, historyBubble];
+    });
+    if (onRestoreConsumed) onRestoreConsumed();
+  }, [restoreMsg]);
 
   const handleNewChat = () => {
     if (messages.length > 0 &&
@@ -1489,6 +1526,7 @@ export default function App() {
   // Classic mode restore bridge
   const classicRestoreRef = useRef({ pending: null, clear: () => {} });
   const [restoreTick, setRestoreTick] = useState(0);
+  const [chatRestoreMsg, setChatRestoreMsg] = useState(null);
 
   const pollHealth = useCallback(async () => {
     try {
@@ -1506,21 +1544,31 @@ export default function App() {
 
   const handleRestore = (msg) => {
     const restored = {
-      session_id:    msg.session_id,
-      query:         msg.query,
-      answer:        msg.answer,
-      confidence:    msg.confidence,
-      mode:          msg.mode,
-      references:    msg.references   ?? [],
-      agent_trace:   msg.agent_trace  ?? [],
-      shap_analysis: msg.shap_analysis ?? {},
-      message_id:    msg.id,
+      session_id:        msg.session_id,
+      query:             msg.query,
+      answer:            msg.answer,
+      confidence:        msg.confidence,
+      trust_score:       msg.trust_data?.trust_score ?? msg.confidence,
+      trust_level:       msg.trust_data?.trust_level ?? "—",
+      mode:              msg.mode,
+      references:        msg.references        ?? [],
+      agent_trace:       msg.agent_trace       ?? [],
+      shap_analysis:     msg.shap_analysis     ?? {},
+      faithfulness_data: msg.faithfulness_data ?? {},
+      lime_data:         msg.lime_data         ?? {},
+      trust_data:        msg.trust_data        ?? {},
+      message_id:        msg.id,
     };
-    // Switch to classic and restore
-    setAppMode("classic");
-    classicRestoreRef.current.pending = restored;
-    classicRestoreRef.current.clear   = () => { classicRestoreRef.current.pending = null; };
-    setRestoreTick(t => t + 1);
+
+    if (appMode === "chat") {
+      // Inject restored message into the chat thread as a read-only historical bubble
+      setChatRestoreMsg(restored);
+    } else {
+      // Classic mode: load into result panel
+      classicRestoreRef.current.pending = restored;
+      classicRestoreRef.current.clear   = () => { classicRestoreRef.current.pending = null; };
+      setRestoreTick(t => t + 1);
+    }
   };
 
   const statusColor = (s) =>
@@ -1614,7 +1662,7 @@ export default function App() {
         {/* Main content — swap based on mode */}
         {appMode === "classic"
           ? <ClassicMode key={restoreTick} onRestore={classicRestoreRef.current} />
-          : <ChatMode />
+          : <ChatMode restoreMsg={chatRestoreMsg} onRestoreConsumed={() => setChatRestoreMsg(null)} />
         }
       </div>
     </div>

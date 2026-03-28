@@ -223,9 +223,6 @@ async def query_endpoint(req: QueryRequest):
             references=result["references"],
             agent_trace=result["agent_trace"],
             shap_analysis=shap_data,
-            faithfulness_data=result["faithfulness_data"],
-            lime_data=result["lime_data"],
-            trust_data=trust_data,
         )
 
         return QueryResponse(
